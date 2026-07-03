@@ -15,6 +15,9 @@ import Entry from "./pages/Entry.vue";
 import ManageStatusPage from "./pages/ManageStatusPage.vue";
 import AddStatusPage from "./pages/AddStatusPage.vue";
 import NotFound from "./pages/NotFound.vue";
+import Overview from "./pages/Overview.vue";
+import GroupView from "./pages/GroupView.vue";
+import IncidentsPage from "./pages/IncidentsPage.vue";
 import DockerHosts from "./components/settings/Docker.vue";
 import ManageMaintenance from "./pages/ManageMaintenance.vue";
 import APIKeys from "./components/settings/APIKeys.vue";
@@ -161,6 +164,10 @@ const routes = [
                         path: "/maintenance/clone/:id",
                         component: EditMaintenance,
                     },
+                    {
+                        path: "/incidents",
+                        component: IncidentsPage,
+                    },
                 ],
             },
         ],
@@ -184,6 +191,14 @@ const routes = [
     {
         path: "/status/:slug",
         component: StatusPage,
+    },
+    {
+        path: "/overview",
+        component: Overview,
+    },
+    {
+        path: "/group/:id",
+        component: GroupView,
     },
     {
         path: "/:pathMatch(.*)*",

@@ -1717,6 +1717,21 @@
                                 </div>
                             </div>
 
+                            <div class="my-3 form-check">
+                                <input
+                                    id="require-incident-report"
+                                    v-model="monitor.requireIncidentReport"
+                                    class="form-check-input"
+                                    type="checkbox"
+                                />
+                                <label class="form-check-label" for="require-incident-report">
+                                    {{ $t("requireIncidentReport") }}
+                                </label>
+                                <div class="form-text">
+                                    {{ $t("requireIncidentReportDescription") }}
+                                </div>
+                            </div>
+
                             <div v-if="monitor.type === 'gamedig'" class="my-3 form-check">
                                 <input
                                     id="gamedig-guess-port"

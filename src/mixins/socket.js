@@ -19,6 +19,8 @@ let socket;
 const noSocketIOPages = [
     /^\/status-page$/, //  /status-page
     /^\/status/, // /status**
+    /^\/overview/, // /overview
+    /^\/group/, // /group/**
     /^\/$/, //  /
 ];
 
@@ -231,6 +233,10 @@ export default {
 
                     this.emitter.emit("newImportantHeartbeat", data);
                 }
+            });
+
+            socket.on("monitorIncidentCreated", (data) => {
+                this.emitter.emit("monitorIncidentCreated", data);
             });
 
             socket.on("heartbeatList", (monitorID, data, overwrite = false) => {

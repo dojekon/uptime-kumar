@@ -209,6 +209,7 @@ const { resetChrome } = require("./monitor-types/real-browser-monitor-type");
 const { EmbeddedMariaDB } = require("./embedded-mariadb");
 const { SetupDatabase } = require("./setup-database");
 const { chartSocketHandler } = require("./socket-handlers/chart-socket-handler");
+const { monitorIncidentSocketHandler } = require("./socket-handlers/monitor-incident-socket-handler");
 
 app.use(express.json());
 
@@ -782,6 +783,9 @@ let needSetup = false;
                 if (monitor.retryOnlyOnStatusCodeFailure !== undefined) {
                     bean.retry_only_on_status_code_failure = monitor.retryOnlyOnStatusCodeFailure;
                 }
+                if (monitor.requireIncidentReport !== undefined) {
+                    bean.require_incident_report = monitor.requireIncidentReport;
+                }
                 bean.user_id = socket.userID;
 
                 bean.validate();
@@ -951,6 +955,7 @@ let needSetup = false;
                 bean.manual_status = monitor.manual_status;
                 bean.system_service_name = monitor.system_service_name;
                 bean.expected_tls_alert = monitor.expectedTlsAlert;
+                bean.require_incident_report = monitor.requireIncidentReport;
 
                 // ping advanced options
                 bean.ping_numeric = monitor.ping_numeric;
@@ -1736,6 +1741,7 @@ let needSetup = false;
         remoteBrowserSocketHandler(socket);
         generalSocketHandler(socket, server);
         chartSocketHandler(socket);
+        monitorIncidentSocketHandler(socket);
 
         log.debug("server", "added all socket handlers");
 

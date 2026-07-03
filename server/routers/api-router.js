@@ -18,6 +18,7 @@ const { Prometheus } = require("../prometheus");
 const Database = require("../database");
 const { UptimeCalculator } = require("../uptime-calculator");
 const { Settings } = require("../settings");
+const MonitorIncident = require("../model/monitor_incident");
 
 let router = express.Router();
 
@@ -635,5 +636,133 @@ async function isMonitorPublic(monitorID) {
     );
     return !!publicMonitor;
 }
+
+function computeOverallStatus(monitors, heartbeatMap) {
+    const activeMonitors = monitors.filter((m) => m.type !== "group");
+    if (activeMonitors.length === 0) return "unknown";
+
+    const hasDown = activeMonitors.some((m) => heartbeatMap[m.id]?.status === DOWN);
+    const hasPending = activeMonitors.some((m) => heartbeatMap[m.id]?.status === PENDING);
+    const hasMaintenance = activeMonitors.some((m) => heartbeatMap[m.id]?.status === MAINTENANCE);
+    const allUp = activeMonitors.every((m) => heartbeatMap[m.id]?.status === UP);
+
+    if (hasDown) return "down";
+    if (hasPending) return "pending";
+    if (hasMaintenance) return "maintenance";
+    if (allUp) return "up";
+    return "unknown";
+}
+
+router.get("/api/overview/data", async (request, response) => {
+    allowDevAllOrigin(response);
+
+    try {
+        const monitors = await R.getAll("SELECT id, name, type, parent, require_incident_report FROM monitor WHERE active = 1 ORDER BY weight DESC, name");
+
+        const heartbeatMap = {};
+        for (const monitor of monitors) {
+            const hb = await Monitor.getPreviousHeartbeat(monitor.id);
+            heartbeatMap[monitor.id] = hb ? { status: hb.status, ping: hb.ping, msg: hb.msg, time: hb.time } : null;
+        }
+
+        const incidents = await MonitorIncident.getAllIncidents();
+        const incidentData = await Promise.all(
+            incidents.map(async (i) => {
+                const json = i.toJSON();
+                const timeline = await i.getTimeline();
+                json.timeline = timeline.map((t) => ({
+                    id: t.id,
+                    stage: t.stage,
+                    created_date: t.created_date,
+                }));
+                return json;
+            })
+        );
+
+        const groups = monitors.filter((m) => m.type === "group");
+        const ungrouped = monitors.filter((m) => m.parent === null && m.type !== "group");
+        const children = monitors.filter((m) => m.parent !== null);
+
+        const overallStatus = computeOverallStatus(monitors, heartbeatMap);
+
+        response.json({
+            ok: true,
+            overallStatus,
+            groups: groups.map((g) => ({
+                id: g.id,
+                name: g.name,
+                status: heartbeatMap[g.id]?.status ?? -1,
+            })),
+            children,
+            ungrouped,
+            heartbeatMap,
+            incidents: incidentData,
+        });
+    } catch (error) {
+        response.status(500).json({
+            ok: false,
+            msg: error.message,
+        });
+    }
+});
+
+router.get("/api/overview/heartbeats", async (request, response) => {
+    allowDevAllOrigin(response);
+
+    try {
+        const days = parseInt(request.query.days) || 90;
+        const points = parseInt(request.query.points) || 60;
+        const bucketSizeDays = days / points;
+        const startDate = dayjs.utc().subtract(days, "day").toISOString();
+
+        const monitors = await R.getAll("SELECT id FROM monitor WHERE active = 1 AND type != 'group' ORDER BY weight DESC, name");
+        const monitorIds = monitors.map((m) => m.id);
+
+        if (monitorIds.length === 0) {
+            return response.json({ ok: true, heartbeatData: {}, points, days });
+        }
+
+        const placeholders = monitorIds.map(() => "?").join(",");
+        const sql = `
+            SELECT
+                monitor_id,
+                CAST((julianday(time) - julianday(?)) / ? AS INTEGER) AS bucket_idx,
+                MIN(status) AS status,
+                MIN(time) AS bucket_start,
+                MAX(time) AS bucket_end
+            FROM heartbeat
+            WHERE monitor_id IN (${placeholders})
+                AND time >= ?
+            GROUP BY monitor_id, bucket_idx
+            ORDER BY monitor_id, bucket_idx
+        `;
+
+        const params = [startDate, bucketSizeDays, ...monitorIds, startDate];
+        const rows = await R.getAll(sql, params);
+
+        const heartbeatData = {};
+        for (const row of rows) {
+            if (!heartbeatData[row.monitor_id]) {
+                heartbeatData[row.monitor_id] = [];
+            }
+            heartbeatData[row.monitor_id].push({
+                bucketIdx: row.bucket_idx,
+                status: row.status,
+                start: row.bucket_start,
+                end: row.bucket_end,
+            });
+        }
+
+        for (const monitorId of monitorIds) {
+            if (!heartbeatData[monitorId]) {
+                heartbeatData[monitorId] = [];
+            }
+        }
+
+        response.json({ ok: true, heartbeatData, points, days });
+    } catch (error) {
+        response.status(500).json({ ok: false, msg: error.message });
+    }
+});
 
 module.exports = router;

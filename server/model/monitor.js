@@ -62,6 +62,7 @@ const zlib = require("node:zlib");
 const { promisify } = require("node:util");
 const brotliCompress = promisify(zlib.brotliCompress);
 const DomainExpiry = require("./domain_expiry");
+const MonitorIncident = require("./monitor_incident");
 
 const rootCertificates = rootCertificatesFingerprints();
 
@@ -212,6 +213,7 @@ class Monitor extends BeanModel {
             saveResponse: this.getSaveResponse(),
             saveErrorResponse: this.getSaveErrorResponse(),
             responseMaxLength: this.response_max_length ?? RESPONSE_BODY_LENGTH_DEFAULT,
+            requireIncidentReport: Boolean(this.require_incident_report),
         };
 
         if (includeSensitiveData) {
@@ -979,6 +981,31 @@ class Monitor extends BeanModel {
                 apicache.clear();
 
                 await UptimeKumaServer.getInstance().sendMaintenanceListByUserID(this.user_id);
+
+                if (this.require_incident_report && isImportant && bean.status === DOWN) {
+                    try {
+                        const existingActive = await R.findOne(
+                            "monitor_incident", " monitor_id = ? AND active = 1 ", [this.id]
+                        );
+                        if (!existingActive) {
+                            const incident = R.dispense("monitor_incident");
+                            incident.monitor_id = this.id;
+                            incident.title = `Недоступность сервиса ${this.name}`;
+                        incident.content = `**Дата фиксации:** ${dayjs.utc().format("DD.MM.YYYY HH:mm")}\n\n**Сообщение:** ${bean.msg || "—"}`;
+                            incident.content = "";
+                            incident.stage = "recorded";
+                            incident.active = true;
+                            incident.created_date = R.isoDateTime(dayjs.utc());
+                            incident.last_updated_date = R.isoDateTime(dayjs.utc());
+                            await R.store(incident);
+                            await incident.recordTimelineEntry(incident.stage);
+                            log.info("monitor", `[${this.name}] Auto-created incident #${incident.id}`);
+                            io.to(this.user_id).emit("monitorIncidentCreated", incident);
+                        }
+                    } catch (e) {
+                        log.error("monitor", `[${this.name}] Failed to auto-create incident: ${e.message}`);
+                    }
+                }
             } else {
                 bean.important = false;
 

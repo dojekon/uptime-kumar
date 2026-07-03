@@ -301,6 +301,38 @@
                 </div>
             </transition>
 
+            <!-- Incident Reports -->
+            <div v-if="monitor && monitor.requireIncidentReport" class="mt-4">
+                <MonitorIncidentList
+                    :incidents="monitorIncidents"
+                    :can-resolve="isMonitorUp"
+                    @create="showCreateIncident"
+                    @edit="showEditIncident"
+                    @resolve="resolveIncident"
+                    @delete="deleteIncident"
+                    @open-detail="openIncidentDetail"
+                />
+            </div>
+
+            <MonitorIncidentEdit
+                ref="incidentEditModal"
+                :is-edit="isEditingIncident"
+                :is-active="editingIncidentActive"
+                @save="saveIncident"
+            />
+
+            <IncidentDetailModal ref="incidentDetailModal" @updated="loadMonitorIncidents" />
+
+            <Confirm
+                ref="confirmDeleteIncident"
+                btn-style="btn-danger"
+                :yes-text="$t('Yes')"
+                :no-text="$t('No')"
+                @yes="confirmDeleteIncident"
+            >
+                {{ $t("deleteIncidentMsg") }}
+            </Confirm>
+
             <!-- Ping Chart -->
             <div v-if="showPingChartBox" class="shadow-box big-padding text-center ping-chart-wrapper">
                 <div class="row">
@@ -462,6 +494,9 @@ import "prismjs/components/prism-css";
 import { PrismEditor } from "vue-prism-editor";
 import "vue-prism-editor/dist/prismeditor.min.css";
 import ScreenshotDialog from "../components/ScreenshotDialog.vue";
+import MonitorIncidentList from "../components/MonitorIncidentList.vue";
+import MonitorIncidentEdit from "../components/MonitorIncidentEdit.vue";
+import IncidentDetailModal from "../components/IncidentDetailModal.vue";
 
 export default {
     components: {
@@ -477,6 +512,9 @@ export default {
         CertificateInfo,
         PrismEditor,
         ScreenshotDialog,
+        MonitorIncidentList,
+        MonitorIncidentEdit,
+        IncidentDetailModal,
     },
     data() {
         return {
@@ -498,6 +536,11 @@ export default {
                 code: "",
             },
             deleteChildrenMonitors: false,
+            monitorIncidents: [],
+            isEditingIncident: false,
+            editingIncidentActive: true,
+            editingIncidentId: null,
+            deletingIncidentId: null,
         };
     },
     computed: {
@@ -524,6 +567,11 @@ export default {
          */
         hasChildren() {
             return this.childrenCount > 0;
+        },
+
+        isMonitorUp() {
+            const heartbeat = this.lastHeartBeat;
+            return heartbeat && heartbeat.status === 1;
         },
 
         lastHeartBeat() {
@@ -624,8 +672,10 @@ export default {
 
     mounted() {
         this.getImportantHeartbeatListLength();
+        this.loadMonitorIncidents();
 
         this.$root.emitter.on("newImportantHeartbeat", this.onNewImportantHeartbeat);
+        this.$root.emitter.on("monitorIncidentCreated", this.onMonitorIncidentCreated);
 
         if (this.monitor && this.monitor.type === "push") {
             if (this.lastHeartBeat.status === -1) {
@@ -637,6 +687,7 @@ export default {
 
     beforeUnmount() {
         this.$root.emitter.off("newImportantHeartbeat", this.onNewImportantHeartbeat);
+        this.$root.emitter.off("monitorIncidentCreated", this.onMonitorIncidentCreated);
     },
 
     methods: {
@@ -864,6 +915,82 @@ export default {
 
         secondsToHumanReadableFormat(seconds) {
             return timeDurationFormatter.secondsToHumanReadableFormat(seconds);
+        },
+
+        loadMonitorIncidents() {
+            if (this.monitor && this.monitor.requireIncidentReport) {
+                this.$root.getSocket().emit("getMonitorIncidents", this.monitor.id, (res) => {
+                    if (res.ok) {
+                        this.monitorIncidents = res.incidents;
+                    }
+                });
+            }
+        },
+
+        onMonitorIncidentCreated(incident) {
+            if (this.monitor && incident.monitor_id === this.monitor.id) {
+                this.monitorIncidents.unshift(incident);
+            }
+        },
+
+        showCreateIncident() {
+            this.isEditingIncident = false;
+            this.editingIncidentActive = true;
+            this.editingIncidentId = null;
+            this.$refs.incidentEditModal.show(null);
+        },
+
+        showEditIncident(incident) {
+            this.isEditingIncident = true;
+            this.editingIncidentActive = incident.active;
+            this.editingIncidentId = incident.id;
+            this.$refs.incidentEditModal.show(incident);
+        },
+
+        saveIncident(form) {
+            if (this.isEditingIncident) {
+                this.$root.getSocket().emit("updateMonitorIncident", this.editingIncidentId, form, (res) => {
+                    if (res.ok) {
+                        this.loadMonitorIncidents();
+                    }
+                });
+            } else {
+                this.$root.getSocket().emit("createMonitorIncident", this.monitor.id, form, (res) => {
+                    if (res.ok) {
+                        this.loadMonitorIncidents();
+                    }
+                });
+            }
+        },
+
+        resolveIncident(incident) {
+            const heartbeat = this.lastHeartBeat;
+            const status = heartbeat ? heartbeat.status : 0;
+            this.$root.getSocket().emit("resolveMonitorIncident", incident.id, status, (res) => {
+                if (res.ok) {
+                    this.loadMonitorIncidents();
+                } else {
+                    this.$root.toastError(res.msg);
+                }
+            });
+        },
+
+        openIncidentDetail(incident) {
+            this.$refs.incidentDetailModal.show(incident.id);
+        },
+
+        deleteIncident(incident) {
+            this.deletingIncidentId = incident.id;
+            this.$refs.confirmDeleteIncident.show();
+        },
+
+        confirmDeleteIncident() {
+            this.$root.getSocket().emit("deleteMonitorIncident", this.deletingIncidentId, (res) => {
+                if (res.ok) {
+                    this.loadMonitorIncidents();
+                }
+            });
+            this.deletingIncidentId = null;
         },
     },
 };

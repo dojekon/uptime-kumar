@@ -34,9 +34,9 @@
 
             <ul class="nav nav-pills">
                 <li v-if="$root.loggedIn" class="nav-item me-2">
-                    <router-link to="/manage-status-page" class="nav-link">
-                        <font-awesome-icon icon="stream" />
-                        {{ $t("Status Pages") }}
+                    <router-link to="/incidents" class="nav-link">
+                        <font-awesome-icon icon="exclamation-triangle" />
+                        {{ $t("monitorIncidents") }}
                     </router-link>
                 </li>
                 <li v-if="$root.loggedIn" class="nav-item me-2">
