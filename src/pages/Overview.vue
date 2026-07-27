@@ -130,6 +130,19 @@
         >
             <div class="bar-tooltip-time">{{ barTooltip.timeText }}</div>
             <div
+                v-for="(entry, idx) in barTooltip.downtimeEntries"
+                :key="'dt-' + idx"
+                class="bar-tooltip-downtime"
+            >
+                <span style="white-space: pre-line">{{ entry.text }}</span>
+            </div>
+            <div
+                v-if="barTooltip.downtimeText && barTooltip.downtimeEntries.length === 0"
+                class="bar-tooltip-downtime"
+            >
+                <span style="white-space: pre-line">{{ barTooltip.downtimeText }}</span>
+            </div>
+            <div
                 v-for="item in barTooltip.incidents"
                 :key="item.incident.id"
                 class="bar-tooltip-incident"
@@ -168,7 +181,7 @@ export default {
             dataReady: false,
             timer: null,
             timelineData: {},
-            totalPoints: 60,
+            totalPoints: 90,
             selectedGroupName: "",
             selectedGroupChildren: [],
             popup: {
@@ -192,6 +205,8 @@ export default {
                 y: 0,
                 timeText: "",
                 incidents: [],
+                downtimeText: "",
+                downtimeEntries: [],
             },
             barTooltipHideTimeout: null,
         };
@@ -270,7 +285,7 @@ export default {
             try {
                 const [dataRes, hbRes] = await Promise.all([
                     fetch("/api/overview/data"),
-                    fetch("/api/overview/heartbeats?days=90&points=60"),
+                    fetch("/api/overview/heartbeats?days=90&points=90"),
                 ]);
                 const dataJson = await dataRes.json();
                 const hbJson = await hbRes.json();
@@ -288,7 +303,7 @@ export default {
 
                 if (hbJson.ok) {
                     this.timelineData = hbJson.heartbeatData || {};
-                    this.totalPoints = hbJson.points || 60;
+                    this.totalPoints = hbJson.points || 90;
                 }
             } catch (e) {
                 console.error("Failed to fetch overview data:", e);
@@ -354,6 +369,7 @@ export default {
                 end: null,
                 monitorName: "",
                 incidents: [],
+                downtimeEntries: [],
             }));
 
             if (children.length === 0) {
@@ -408,6 +424,22 @@ export default {
                     segStatus = "maintenance";
                 }
 
+                // Collect downtime entries from children with requireIncidentReport=false
+                const downtimeEntries = [];
+                for (const child of children) {
+                    const data = this.timelineData[child.id];
+                    const entry = data?.find((e) => e.bucketIdx === i);
+                    if (entry && entry.status === _DOWN && child && !child.requireIncidentReport && entry.downTime) {
+                        const d = new Date(entry.downTime);
+                        downtimeEntries.push({
+                            text: child.name + "\n" +
+                                  d.toLocaleDateString("ru-RU", { month: "short", day: "numeric" }) + "\n" +
+                                  d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }) + " " +
+                                  (entry.downMsg || "неизвестная ошибка"),
+                        });
+                    }
+                }
+
                 segs[i] = {
                     status: segStatus,
                     title: segTitle,
@@ -415,6 +447,7 @@ export default {
                     end: bucketEnd,
                     monitorName: segMonitorName,
                     incidents: infoArr,
+                    downtimeEntries,
                 };
             }
 
@@ -487,6 +520,9 @@ export default {
                 start: null,
                 end: null,
                 incidents: [],
+                downTime: null,
+                downMsg: "",
+                monitorId: null,
             }));
 
             for (const entry of data) {
@@ -523,6 +559,9 @@ export default {
                         start: entry.start,
                         end: entry.end,
                         incidents: incidentList,
+                        downTime: entry.downTime || null,
+                        downMsg: entry.downMsg || "",
+                        monitorId,
                     };
                 }
             }
@@ -553,12 +592,34 @@ export default {
 
             const timeText = seg.start ? this.formatTooltipTime(seg.start, seg.end) : "Нет данных";
 
+            // Build downtime text for monitors with requireIncidentReport=false
+            let downtimeText = "";
+            let downtimeEntries = [];
+
+            if (seg.downtimeEntries && seg.downtimeEntries.length > 0) {
+                // Group bar: use pre-computed downtimeEntries
+                downtimeEntries = seg.downtimeEntries;
+                downtimeText = downtimeEntries.map((e) => e.text).join("\n");
+            } else if (seg.monitorId && seg.downTime) {
+                // Ungrouped bar: look up monitor and check requireIncidentReport
+                const allMonitors = [...this.children, ...this.ungrouped];
+                const monitor = allMonitors.find((m) => m.id === seg.monitorId);
+                if (monitor && !monitor.requireIncidentReport) {
+                    const d = new Date(seg.downTime);
+                    downtimeText = d.toLocaleDateString("ru-RU", { month: "short", day: "numeric" }) + "\n" +
+                                   d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }) + " " +
+                                   (seg.downMsg || "неизвестная ошибка");
+                }
+            }
+
             this.barTooltip = {
                 visible: true,
                 x: event.clientX,
                 y: event.clientY + 8,
                 timeText,
                 incidents: seg.incidents || [],
+                downtimeText,
+                downtimeEntries,
             };
         },
 
@@ -1066,5 +1127,14 @@ export default {
 
 .bar-tooltip-incident:hover {
     color: #fca5a5;
+}
+
+.bar-tooltip-downtime {
+    margin-top: 6px;
+    font-size: 12px;
+    color: #facc15;
+    pointer-events: auto;
+    text-align: left;
+    line-height: 1.3;
 }
 </style>

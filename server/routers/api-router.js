@@ -683,6 +683,14 @@ router.get("/api/overview/data", async (request, response) => {
         const ungrouped = monitors.filter((m) => m.parent === null && m.type !== "group");
         const children = monitors.filter((m) => m.parent !== null);
 
+        // Raw R.getAll rows are plain objects (not Monitor beans), so toJSON()
+        // is never invoked. Expose requireIncidentReport as a real boolean to
+        // match the Monitor model contract (see monitor.js toJSON).
+        const withIncidentFlag = (m) => ({
+            ...m,
+            requireIncidentReport: Boolean(m.require_incident_report),
+        });
+
         const overallStatus = computeOverallStatus(monitors, heartbeatMap);
 
         response.json({
@@ -693,8 +701,8 @@ router.get("/api/overview/data", async (request, response) => {
                 name: g.name,
                 status: heartbeatMap[g.id]?.status ?? -1,
             })),
-            children,
-            ungrouped,
+            children: children.map(withIncidentFlag),
+            ungrouped: ungrouped.map(withIncidentFlag),
             heartbeatMap,
             incidents: incidentData,
         });
@@ -711,9 +719,10 @@ router.get("/api/overview/heartbeats", async (request, response) => {
 
     try {
         const days = parseInt(request.query.days) || 90;
-        const points = parseInt(request.query.points) || 60;
-        const bucketSizeDays = days / points;
-        const startDate = dayjs.utc().subtract(days, "day").toISOString();
+        // Default is 90 so that one segment maps to exactly one calendar day
+        // (90 days / 90 segments). `points` is kept for backwards compatibility
+        // but no longer drives bucket sizing — grouping is always per calendar day.
+        const points = parseInt(request.query.points) || 90;
 
         const monitors = await R.getAll("SELECT id FROM monitor WHERE active = 1 AND type != 'group' ORDER BY weight DESC, name");
         const monitorIds = monitors.map((m) => m.id);
@@ -725,31 +734,44 @@ router.get("/api/overview/heartbeats", async (request, response) => {
         const placeholders = monitorIds.map(() => "?").join(",");
         const sql = `
             SELECT
-                monitor_id,
-                CAST((julianday(time) - julianday(?)) / ? AS INTEGER) AS bucket_idx,
-                MIN(status) AS status,
-                MIN(time) AS bucket_start,
-                MAX(time) AS bucket_end
-            FROM heartbeat
-            WHERE monitor_id IN (${placeholders})
-                AND time >= ?
-            GROUP BY monitor_id, bucket_idx
-            ORDER BY monitor_id, bucket_idx
+                h.monitor_id,
+                (julianday('now') - julianday(DATE(h.time))) AS days_ago,
+                MIN(h.status) AS status,
+                MIN(h.time) AS bucket_start,
+                MAX(h.time) AS bucket_end,
+                MIN(CASE WHEN h.status = 0 THEN h.time END) AS down_time,
+                (
+                    SELECT h2.msg
+                    FROM heartbeat h2
+                    WHERE h2.monitor_id = h.monitor_id
+                        AND DATE(h2.time) = DATE(h.time)
+                        AND h2.status = 0
+                    ORDER BY h2.time
+                    LIMIT 1
+                ) AS down_msg
+            FROM heartbeat h
+            WHERE h.monitor_id IN (${placeholders})
+            GROUP BY h.monitor_id, DATE(h.time)
+            HAVING days_ago < ?
+            ORDER BY h.monitor_id, days_ago DESC
         `;
 
-        const params = [startDate, bucketSizeDays, ...monitorIds, startDate];
-        const rows = await R.getAll(sql, params);
+        const rows = await R.getAll(sql, [ ...monitorIds, days ]);
 
+        // bucketIdx: 0 = oldest calendar day in range, days-1 = today.
         const heartbeatData = {};
         for (const row of rows) {
             if (!heartbeatData[row.monitor_id]) {
                 heartbeatData[row.monitor_id] = [];
             }
+            const bucketIdx = (days - 1) - Math.floor(row.days_ago);
             heartbeatData[row.monitor_id].push({
-                bucketIdx: row.bucket_idx,
+                bucketIdx,
                 status: row.status,
                 start: row.bucket_start,
                 end: row.bucket_end,
+                downTime: row.down_time,
+                downMsg: row.down_msg,
             });
         }
 

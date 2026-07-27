@@ -40,6 +40,7 @@
             @mouseleave="onTooltipLeave"
         >
             <div class="tooltip-time">{{ tooltip.text }}</div>
+            <div v-if="tooltip.downtimeText" class="tooltip-downtime" style="white-space: pre-line">{{ tooltip.downtimeText }}</div>
             <div v-if="tooltip.incident" class="tooltip-incident" @click="openIncident(tooltip.incident)">
                 {{ tooltip.incident.title }}
             </div>
@@ -62,13 +63,13 @@ export default {
         heartbeatData: { type: Object, default: () => ({}) },
         incidents: { type: Array, default: () => [] },
         heartbeatMap: { type: Object, default: () => ({}) },
-        totalPoints: { type: Number, default: 60 },
+        totalPoints: { type: Number, default: 90 },
     },
     emits: ["open-incident"],
     data() {
         return {
             modal: null,
-            tooltip: { visible: false, x: 0, y: 0, text: "", incident: null },
+            tooltip: { visible: false, x: 0, y: 0, text: "", incident: null, downtimeText: "" },
             tooltipHideTimeout: null,
         };
     },
@@ -92,13 +93,13 @@ export default {
                 if (idx >= 0 && idx < this.totalPoints) {
                     const s = entry.status;
                     if (s === _UP) {
-                        segs[idx] = { status: "up", start: entry.start, end: entry.end };
+                        segs[idx] = { status: "up", start: entry.start, end: entry.end, downTime: entry.downTime, downMsg: entry.downMsg };
                     } else if (s === _DOWN) {
-                        segs[idx] = { status: "down", start: entry.start, end: entry.end };
+                        segs[idx] = { status: "down", start: entry.start, end: entry.end, downTime: entry.downTime, downMsg: entry.downMsg };
                     } else if (s === _PENDING) {
-                        segs[idx] = { status: "pending", start: entry.start, end: entry.end };
+                        segs[idx] = { status: "pending", start: entry.start, end: entry.end, downTime: entry.downTime, downMsg: entry.downMsg };
                     } else if (s === _MAINTENANCE) {
-                        segs[idx] = { status: "maintenance", start: entry.start, end: entry.end };
+                        segs[idx] = { status: "maintenance", start: entry.start, end: entry.end, downTime: entry.downTime, downMsg: entry.downMsg };
                     }
                 }
             }
@@ -158,12 +159,24 @@ export default {
                 incident = this.findIncident(monitorId, seg.start, seg.end);
             }
 
+            let downtimeText = "";
+            if (seg.status === "down" && seg.downTime) {
+                const monitor = this.children.find(c => c.id === monitorId);
+                if (monitor && !monitor.requireIncidentReport) {
+                    const date = new Date(seg.downTime).toLocaleDateString("ru-RU", { month: "short", day: "numeric" });
+                    const time = new Date(seg.downTime).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+                    const msg = seg.downMsg || "неизвестная ошибка";
+                    downtimeText = date + "\n" + time + " " + msg;
+                }
+            }
+
             this.tooltip = {
                 visible: true,
                 x: event.clientX,
                 y: event.clientY + 8,
                 text,
                 incident,
+                downtimeText,
             };
         },
 
@@ -176,6 +189,7 @@ export default {
             this.tooltipHideTimeout = setTimeout(() => {
                 this.tooltip.visible = false;
                 this.tooltip.incident = null;
+                this.tooltip.downtimeText = "";
                 this.tooltipHideTimeout = null;
             }, 200);
         },
@@ -190,6 +204,7 @@ export default {
         onTooltipLeave() {
             this.tooltip.visible = false;
             this.tooltip.incident = null;
+            this.tooltip.downtimeText = "";
             if (this.tooltipHideTimeout) {
                 clearTimeout(this.tooltipHideTimeout);
                 this.tooltipHideTimeout = null;
@@ -298,6 +313,13 @@ export default {
 .tooltip-time {
     font-size: 12px;
     color: #999;
+    pointer-events: none;
+}
+
+.tooltip-downtime {
+    margin-top: 6px;
+    font-size: 12px;
+    color: #e5e5e5;
     pointer-events: none;
 }
 
