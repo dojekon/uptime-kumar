@@ -1132,7 +1132,7 @@ export default {
 .bar-tooltip-downtime {
     margin-top: 6px;
     font-size: 12px;
-    color: #facc15;
+    color: #999;
     pointer-events: auto;
     text-align: left;
     line-height: 1.3;
