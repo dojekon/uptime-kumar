@@ -1,14 +1,13 @@
 /**
- * SMTP-мониторинг для Uptime Kuma.
+ * IMAP-мониторинг для Uptime Kuma.
  *
- * Три режима:
- *  - plain:    connect → 220 → EHLO(↘HELO) → QUIT
- *  - SMTPS:    connect → TLS↑ → 220 → QUIT
- *  - STARTTLS: connect → 220 → EHLO → STARTTLS → TLS↑ → 220 → QUIT
+ * Три режима (те же значения, что в SmtpSecurity):
+ *  - nostarttls: connect → * OK banner → LOGOUT
+ *  - secure:     connect → TLS↑ → * OK banner → LOGOUT
+ *  - starttls:   connect → * OK banner → STARTTLS → TLS↑ → * OK banner → LOGOUT
  *
- * EHLO только там, где он реально нужен: в plain (валидация SMTP-цикла)
- * и в STARTTLS до апгрейда (проверка 250-STARTTLS). После TLS — только
- * баннер 220 и QUIT, потому что живой сервер за TLS уже доказан.
+ * CAPABILITY не требуется отдельным запросом — баннер IMAP уже содержит
+ * список возможностей в квадратных скобках. STARTTLS проверяется по ним же.
  */
 
 const { MonitorType } = require("./monitor-type");
@@ -18,26 +17,44 @@ const tls = require("tls");
 const net = require("net");
 const dayjs = require("dayjs");
 
-// ── Утилиты SMTP-диалога ───────────────────────────────────────────
+// ── Генератор тегов ───────────────────────────────────────────────
 
 /**
- * Читает полный многострочный SMTP-ответ (RFC 5321 §4.2).
- *
- * Разделитель на позиции 3 отрезается; в text попадает чистое содержимое.
- *   "250-mail.example.com\r\n250 STARTTLS\r\n"
- *     → { status: 250, text: ["mail.example.com", "STARTTLS"], raw: "…" }
+ * RFC 3501 §2.2.1: тег — строка из букв/цифр.
+ * Генерируем A0001, A0002, …
  */
-function readSmtpResponse(socket, timeoutMs) {
+const makeTag = (() => {
+    let counter = 0;
+    return () => {
+        counter++;
+        return `A${counter.toString().padStart(4, "0")}`;
+    };
+})();
+
+// ── Утилиты IMAP-диалога ──────────────────────────────────────────
+
+/**
+ * Читает IMAP-ответ до строки, начинающейся с переданного тега.
+ *
+ * Все строки до тегированной попадают в untagged.
+ * Финальная строка вида "A0001 OK …" определяет status.
+ *
+ * @param {net.Socket} socket
+ * @param {string} tag - тег команды (для баннера передаётся "*")
+ * @param {number} timeoutMs
+ * @returns {Promise<{status: string, untagged: string[], raw: string}>}
+ */
+function readImapResponse(socket, tag, timeoutMs) {
     return new Promise((resolve, reject) => {
-        const lines = [];
-        let lastStatus = 0;
+        const untagged = [];
+        let buffer = "";
         let resolved = false;
 
-        const finish = () => {
+        const finish = (status) => {
             if (!resolved) {
                 resolved = true;
                 cleanup();
-                resolve({ status: lastStatus, text: lines, raw: lines.join("\n") });
+                resolve({ status, untagged, raw: untagged.join("\n") });
             }
         };
 
@@ -45,30 +62,38 @@ function readSmtpResponse(socket, timeoutMs) {
             if (!resolved) {
                 resolved = true;
                 cleanup();
-                reject(new Error("SMTP response timed out"));
+                reject(new Error("IMAP response timed out"));
             }
         }, timeoutMs);
 
         const onData = (chunk) => {
-            const raw = chunk.toString();
-            const chunkLines = raw.split("\r\n").filter((l) => l.length > 0);
-            for (const line of chunkLines) {
-                if (line.length < 3) continue;
-                const status = parseInt(line.slice(0, 3), 10);
-                if (Number.isNaN(status)) continue;
-                lastStatus = status;
+            buffer += chunk.toString();
+            while (buffer.includes("\r\n")) {
+                const idx = buffer.indexOf("\r\n");
+                const line = buffer.slice(0, idx);
+                buffer = buffer.slice(idx + 2);
 
-                if (line.length === 3) {
-                    lines.push("");
-                    finish();
+                if (line.length === 0) continue;
+
+                if (tag === "*") {
+                    if (line.startsWith("* ")) {
+                        const parts = line.split(" ");
+                        const status = parts[1] || "UNKNOWN";
+                        untagged.push(line.slice(2));
+                        finish(status);
+                        return;
+                    }
+                    continue;
+                }
+
+                if (line.startsWith(tag + " ")) {
+                    const parts = line.split(" ");
+                    const status = parts[1];
+                    finish(status);
                     return;
                 }
 
-                lines.push(line.slice(4));
-                if (line[3] === " ") {
-                    finish();
-                    return;
-                }
+                untagged.push(line);
             }
         };
 
@@ -101,41 +126,54 @@ function readSmtpResponse(socket, timeoutMs) {
     });
 }
 
-/** Отправляет SMTP-команду и читает ответ. Если command === null — только читает (баннер). */
-async function smtpCommand(socket, command, timeoutMs) {
+/**
+ * Отправляет тегированную IMAP-команду и читает ответ.
+ * Если command === null — только читает баннер (ждёт "* …").
+ */
+async function imapCommand(socket, command, timeoutMs) {
     if (command) {
-        socket.write(command + "\r\n");
+        const tag = makeTag();
+        socket.write(`${tag} ${command}\r\n`);
+        return readImapResponse(socket, tag, timeoutMs);
     }
-    return readSmtpResponse(socket, timeoutMs);
+    return readImapResponse(socket, "*", timeoutMs);
 }
 
 /**
- * EHLO.
- * При успехе (250) возвращает список capabilities.
- * При неудаче бросает ошибку — вызывающая сторона может откатиться на HELO.
+ * Парсит IMAP-баннер.
+ *
+ * "* OK [CAPABILITY IMAP4rev1 SASL-IR …] Dovecot ready."
+ *   → { status: "OK", capabilities: ["IMAP4REV1", "SASL-IR", …], text: "Dovecot ready." }
  */
-async function smtpEhlo(socket, hostname, timeoutMs) {
-    const resp = await smtpCommand(socket, `EHLO ${hostname}`, timeoutMs);
-    if (resp.status !== 250) {
-        throw new Error(`EHLO failed with status ${resp.status}: ${resp.raw}`);
-    }
-    // Первая строка — приветствие, остальные — возможности
-    const features = resp.text.slice(1).map((s) => s.trim().toUpperCase());
-    return { features, raw: resp.raw };
+function parseBanner(rawLine) {
+    const parts = rawLine.split(" ");
+    const status = parts[0] || "UNKNOWN";
+
+    const capMatch = rawLine.match(/\[CAPABILITY\s+([^\]]+)\]/i);
+    const capabilities = capMatch
+        ? capMatch[1].split(/\s+/).map((s) => s.toUpperCase())
+        : [];
+
+    const bracketEnd = rawLine.lastIndexOf("]");
+    const text = bracketEnd >= 0
+        ? rawLine.slice(bracketEnd + 1).trim()
+        : rawLine.slice(status.length).trim();
+
+    return { status, capabilities, text };
 }
 
 // ── Основной класс ─────────────────────────────────────────────────
 
-class SMTPMonitorType extends MonitorType {
-    name = "smtp";
+class IMAPMonitorType extends MonitorType {
+    name = "imap";
 
     /** @inheritdoc */
     async check(monitor, heartbeat, _server) {
-        const security = monitor.smtpSecurity || "nostarttls";
+        const security = monitor.smtpSecurity || "starttls";
         const startTime = dayjs().valueOf();
 
         if (security === "secure") {
-            await this.checkSmtps(monitor, heartbeat, startTime);
+            await this.checkImaps(monitor, heartbeat, startTime);
         } else if (security === "starttls") {
             await this.checkStartTls(monitor, heartbeat, startTime);
         } else {
@@ -146,42 +184,25 @@ class SMTPMonitorType extends MonitorType {
     // ── Режимы ─────────────────────────────────────────────────
 
     /**
-     * Plain SMTP (без TLS, порт 25).
-     * Диалог: 220 → EHLO(↘HELO) → QUIT.
+     * Plain IMAP (без TLS, порт 143).
+     * Диалог: баннер → LOGOUT.
      */
     async checkPlain(monitor, heartbeat, startTime) {
         const timeoutMs = (monitor.timeout || TIMEOUT) * 1000;
-        const socket = await this.connectSocket(monitor, timeoutMs, 25);
+        const socket = await this.connectSocket(monitor, timeoutMs, 143);
 
         try {
-            // Баннер
-            const banner = await smtpCommand(socket, null, timeoutMs);
-            if (banner.status !== 220) {
-                throw new Error(`Unexpected banner: ${banner.status} ${banner.raw}`);
+            const bannerResp = await imapCommand(socket, null, timeoutMs);
+            const banner = parseBanner(bannerResp.untagged[0] || bannerResp.raw);
+            this.validateBanner(banner);
+
+            await imapCommand(socket, "LOGOUT", timeoutMs);
+
+            const parts = ["IMAP OK"];
+            if (banner.text) parts.push(banner.text);
+            if (banner.capabilities.length) {
+                parts.push(banner.capabilities.slice(0, 5).join(", "));
             }
-
-            // EHLO, при неудаче — HELO для plain-SMTP серверов
-            let ehloFeatures = null;
-            let heloFallback = false;
-
-            try {
-                const ehlo = await smtpEhlo(socket, monitor.hostname, timeoutMs);
-                ehloFeatures = ehlo.features;
-            } catch {
-                const heloResp = await smtpCommand(socket, `HELO ${monitor.hostname}`, timeoutMs);
-                if (heloResp.status !== 250) {
-                    throw new Error(`HELO failed with status ${heloResp.status}: ${heloResp.raw}`);
-                }
-                heloFallback = true;
-            }
-
-            await smtpCommand(socket, "QUIT", timeoutMs);
-
-            // Сообщение
-            const software = this._extractSoftware(banner);
-            const parts = [`SMTP OK${heloFallback ? " (HELO)" : ""}`];
-            if (software) parts.push(software);
-            if (ehloFeatures?.length) parts.push(ehloFeatures.slice(0, 5).join(", "));
 
             heartbeat.status = UP;
             heartbeat.ping = dayjs().valueOf() - startTime;
@@ -192,12 +213,12 @@ class SMTPMonitorType extends MonitorType {
     }
 
     /**
-     * SMTPS (TLS сразу, порт 465).
-     * Диалог: TLS↑ → 220 → QUIT. Без EHLO — живой SMTP за TLS уже доказан.
+     * IMAPS (TLS сразу, порт 993).
+     * Диалог: TLS↑ → баннер → LOGOUT.
      */
-    async checkSmtps(monitor, heartbeat, startTime) {
+    async checkImaps(monitor, heartbeat, startTime) {
         const timeoutMs = (monitor.timeout || TIMEOUT) * 1000;
-        const rawSocket = await this.connectSocket(monitor, timeoutMs, 465);
+        const rawSocket = await this.connectSocket(monitor, timeoutMs, 993);
 
         let tlsSocket = null;
 
@@ -211,8 +232,9 @@ class SMTPMonitorType extends MonitorType {
             });
             tlsSocket.setNoDelay(true);
 
-            // SMTP always sends 220 banner after TLS (RFC 3207 §4.2)
-            const bannerPromise = smtpCommand(tlsSocket, null, timeoutMs);
+            // Пробуем прочитать баннер (RFC 9051 §6.2.1) с коротким таймаутом
+            const bannerTimeoutMs = Math.min(timeoutMs, 2000);
+            const bannerPromise = imapCommand(tlsSocket, null, bannerTimeoutMs);
 
             await new Promise((resolve, reject) => {
                 const timer = setTimeout(() => reject(new Error("TLS handshake timed out")), timeoutMs);
@@ -222,18 +244,27 @@ class SMTPMonitorType extends MonitorType {
 
             const tlsTime = dayjs().valueOf() - tlsStart;
 
-            const smtpStart = dayjs().valueOf();
-            const banner = await bannerPromise;
-            if (banner.status !== 220) {
-                throw new Error(`Unexpected banner: ${banner.status} ${banner.raw}`);
+            const imapStart = dayjs().valueOf();
+            let banner = null;
+            try {
+                const bannerResp = await bannerPromise;
+                banner = parseBanner(bannerResp.untagged[0] || bannerResp.raw);
+                this.validateBanner(banner);
+            } catch (e) {
+                // Нет баннера — fallback: CAPABILITY
+                const capResp = await imapCommand(tlsSocket, "CAPABILITY", timeoutMs);
+                if (capResp.status !== "OK") {
+                    throw new Error(`CAPABILITY failed: ${capResp.status}`);
+                }
             }
-            await smtpCommand(tlsSocket, "QUIT", timeoutMs);
-            const smtpTime = dayjs().valueOf() - smtpStart;
+
+            await imapCommand(tlsSocket, "LOGOUT", timeoutMs);
+            const imapTime = dayjs().valueOf() - imapStart;
 
             await this._buildTlsResult(
                 monitor, heartbeat, startTime,
                 tlsSocket, banner,
-                `${tlsTime}+${smtpTime}ms`,
+                `${tlsTime}+${imapTime}ms`,
             );
         } finally {
             if (tlsSocket && !tlsSocket.destroyed) {
@@ -245,37 +276,35 @@ class SMTPMonitorType extends MonitorType {
     }
 
     /**
-     * STARTTLS (порт 587).
-     * Диалог: 220 → EHLO → STARTTLS → TLS↑ → 220 → QUIT.
+     * STARTTLS (порт 143).
+     * Диалог: баннер → STARTTLS → TLS↑ → баннер → LOGOUT.
      */
     async checkStartTls(monitor, heartbeat, startTime) {
         const timeoutMs = (monitor.timeout || TIMEOUT) * 1000;
-        const rawSocket = await this.connectSocket(monitor, timeoutMs, 587);
+        const bannerTimeoutMs = Math.min(timeoutMs, 2000);
+        const rawSocket = await this.connectSocket(monitor, timeoutMs, 143);
 
         let tlsSocket = null;
 
         try {
-            // 1. Баннер
-            const banner = await smtpCommand(rawSocket, null, timeoutMs);
-            if (banner.status !== 220) {
-                throw new Error(`Unexpected banner: ${banner.status} ${banner.raw}`);
-            }
+            // 1. Баннер с capabilities
+            const bannerResp = await imapCommand(rawSocket, null, timeoutMs);
+            const preBanner = parseBanner(bannerResp.untagged[0] || bannerResp.raw);
+            this.validateBanner(preBanner);
 
-            // 2. EHLO — проверяем STARTTLS
-            const ehlo = await smtpEhlo(rawSocket, monitor.hostname, timeoutMs);
-            if (!ehlo.features.includes("STARTTLS")) {
+            if (!preBanner.capabilities.includes("STARTTLS")) {
                 throw new Error("Server does not support STARTTLS");
             }
 
-            // 3. STARTTLS
-            const starttlsResp = await smtpCommand(rawSocket, "STARTTLS", timeoutMs);
-            if (starttlsResp.status !== 220) {
+            // 2. STARTTLS
+            const starttlsResp = await imapCommand(rawSocket, "STARTTLS", timeoutMs);
+            if (starttlsResp.status !== "OK") {
                 throw new Error(
-                    `STARTTLS failed with status ${starttlsResp.status}: ${starttlsResp.raw}`,
+                    `STARTTLS failed: ${starttlsResp.status} ${starttlsResp.raw}`,
                 );
             }
 
-            // 4. TLS-апгрейд — новая SMTP-сессия (RFC 3207 §4.2: сервер шлёт 220)
+            // 3. TLS-апгрейд — новая IMAP-сессия
             const tlsStart = dayjs().valueOf();
 
             tlsSocket = tls.connect({
@@ -285,7 +314,8 @@ class SMTPMonitorType extends MonitorType {
             });
             tlsSocket.setNoDelay(true);
 
-            const postBannerPromise = smtpCommand(tlsSocket, null, timeoutMs);
+            // Пробуем прочитать пост-TLS баннер (RFC 9051 §6.2.1)
+            const bannerPromise = imapCommand(tlsSocket, null, bannerTimeoutMs);
 
             await new Promise((resolve, reject) => {
                 const timer = setTimeout(() => reject(new Error("TLS handshake timed out")), timeoutMs);
@@ -295,20 +325,29 @@ class SMTPMonitorType extends MonitorType {
 
             const tlsTime = dayjs().valueOf() - tlsStart;
 
-            // 5. Новый баннер + QUIT (без EHLO)
-            const smtpStart = dayjs().valueOf();
-            const postBanner = await postBannerPromise;
-            if (postBanner.status !== 220) {
-                throw new Error(
-                    `Unexpected post-TLS banner: ${postBanner.status} ${postBanner.raw}`,
-                );
+            // 4. Читаем пост-TLS баннер; fallback: CAPABILITY + LOGOUT
+            const imapStart = dayjs().valueOf();
+            let postBanner = null;
+            try {
+                const postBannerResp = await bannerPromise;
+                postBanner = parseBanner(postBannerResp.untagged[0] || postBannerResp.raw);
+                this.validateBanner(postBanner);
+            } catch (e) {
+                // Нет баннера — fallback: CAPABILITY
+                const capResp = await imapCommand(tlsSocket, "CAPABILITY", timeoutMs);
+                if (capResp.status !== "OK") {
+                    throw new Error(`CAPABILITY failed: ${capResp.status}`);
+                }
             }
-            await smtpCommand(tlsSocket, "QUIT", timeoutMs);
-            const smtpTime = dayjs().valueOf() - smtpStart;
+
+            // LOGOUT
+            await imapCommand(tlsSocket, "LOGOUT", timeoutMs);
+            const imapTime = dayjs().valueOf() - imapStart;
+
             await this._buildTlsResult(
                 monitor, heartbeat, startTime,
-                tlsSocket, postBanner,
-                `${tlsTime}+${smtpTime}ms`,
+                tlsSocket, postBanner || preBanner,
+                `${tlsTime}+${imapTime}ms`,
             );
         } finally {
             if (tlsSocket && !tlsSocket.destroyed) {
@@ -320,6 +359,15 @@ class SMTPMonitorType extends MonitorType {
     }
 
     // ── Общие хелперы ──────────────────────────────────────────
+
+    /** Валидирует баннер: OK и PREAUTH — норма, остальное — ошибка. */
+    validateBanner(banner) {
+        if (banner.status !== "OK" && banner.status !== "PREAUTH") {
+            throw new Error(
+                `Unexpected banner status: ${banner.status} — ${banner.text}`,
+            );
+        }
+    }
 
     /** TCP-сокет + ожидание подключения. */
     connectSocket(monitor, timeoutMs, defaultPort) {
@@ -364,11 +412,9 @@ class SMTPMonitorType extends MonitorType {
     async _buildTlsResult(monitor, heartbeat, startTime, tlsSocket, banner, timing) {
         const certInfo = await this._checkAndHandleCert(monitor, tlsSocket);
         const tlsSummary = this._getTlsSummary(tlsSocket);
-        const software = this._extractSoftware(banner);
-        const bannerText = banner.text[0]?.trim() || banner.raw.trim();
 
-        const parts = [`SMTP OK — ${bannerText}`];
-        if (software) parts.push(software);
+        const parts = ["IMAP OK"];
+        if (banner && banner.text) parts.push(banner.text);
         if (tlsSummary) parts.push(tlsSummary);
         if (certInfo) {
             parts.push(
@@ -416,19 +462,8 @@ class SMTPMonitorType extends MonitorType {
         if (!cipher) return null;
         return `${cipher.version} ${cipher.standardName || cipher.name}`;
     }
-
-    /** Вытаскивает софт сервера из баннера (всё после имени хоста). */
-    _extractSoftware(banner) {
-        const raw = (banner.text || []).join(" ").trim();
-        const words = raw.split(/\s+/);
-        // Первое слово с точкой — обычно хост, пропускаем
-        let start = 0;
-        if (words[0]?.includes(".")) start = 1;
-        const rest = words.slice(start).join(" ").trim();
-        return rest || null;
-    }
 }
 
 module.exports = {
-    SMTPMonitorType,
+    IMAPMonitorType,
 };

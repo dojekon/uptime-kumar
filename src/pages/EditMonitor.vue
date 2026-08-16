@@ -85,6 +85,7 @@
                                         <option v-if="!$root.info.isContainer" value="sip-options">
                                             SIP Options Ping
                                         </option>
+                                        <option value="imap">IMAP</option>
                                         <option value="smtp">SMTP</option>
                                         <option value="snmp">SNMP</option>
                                         <option v-if="!$root.info.isContainer" value="tailscale-ping">
@@ -483,6 +484,7 @@
                                     monitor.type === 'mqtt' ||
                                     monitor.type === 'radius' ||
                                     monitor.type === 'tailscale-ping' ||
+                                    monitor.type === 'imap' ||
                                     monitor.type === 'smtp' ||
                                     monitor.type === 'snmp' ||
                                     monitor.type === 'sip-options'
@@ -694,6 +696,7 @@
                                     monitor.type === 'gamedig' ||
                                     monitor.type === 'mqtt' ||
                                     monitor.type === 'radius' ||
+                                    monitor.type === 'imap' ||
                                     monitor.type === 'smtp' ||
                                     monitor.type === 'snmp' ||
                                     monitor.type === 'sip-options' ||
@@ -788,6 +791,15 @@
                                     placeholder="SNMPv3 username"
                                     required
                                 />
+                            </div>
+
+                            <div v-if="monitor.type === 'imap'" class="my-3">
+                                <label for="imap_security" class="form-label">{{ $t("IMAP Security") }}</label>
+                                <select id="imap_security" v-model="monitor.smtpSecurity" class="form-select">
+                                    <option value="secure">IMAPS</option>
+                                    <option value="nostarttls">{{ $t("Ignore STARTTLS") }}</option>
+                                    <option value="starttls">{{ $t("Use STARTTLS") }}</option>
+                                </select>
                             </div>
 
                             <div v-if="monitor.type === 'smtp'" class="my-3">
@@ -1559,17 +1571,19 @@
                                     monitor.type === 'json-query' ||
                                     (monitor.type === 'port' &&
                                         ['starttls', 'secure'].includes(monitor.smtpSecurity)) ||
+                                    (monitor.type === 'smtp' &&
+                                        ['starttls', 'secure'].includes(monitor.smtpSecurity)) ||
+                                    (monitor.type === 'imap' &&
+                                        ['starttls', 'secure'].includes(monitor.smtpSecurity)) ||
                                     (monitor.type === 'globalping' && monitor.subtype === 'http')
                                 "
                                 class="my-3 form-check"
-                                :title="monitor.ignoreTls ? $t('ignoredTLSError') : ''"
                             >
                                 <input
                                     id="expiry-notification"
                                     v-model="monitor.expiryNotification"
                                     class="form-check-input"
                                     type="checkbox"
-                                    :disabled="monitor.ignoreTls"
                                 />
                                 <label class="form-check-label" for="expiry-notification">
                                     {{ $t("Certificate Expiry Notification") }}
@@ -1655,6 +1669,8 @@
                                     monitor.type === 'keyword' ||
                                     monitor.type === 'json-query' ||
                                     monitor.type === 'redis' ||
+                                    monitor.type === 'smtp' ||
+                                    monitor.type === 'imap' ||
                                     (monitor.type === 'globalping' && monitor.subtype === 'http')
                                 "
                                 class="my-3 form-check"
@@ -4012,7 +4028,7 @@ message HealthCheckResponse {
 
             // Validate hostname field input for various monitors
             if (
-                ["dns", "port", "ping", "steam", "gamedig", "radius", "tailscale-ping", "smtp", "snmp"].includes(
+                ["dns", "port", "ping", "steam", "gamedig", "radius", "tailscale-ping", "imap", "smtp", "snmp"].includes(
                     this.monitor.type
                 ) &&
                 this.monitor.hostname
