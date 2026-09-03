@@ -732,13 +732,27 @@ router.get("/api/overview/heartbeats", async (request, response) => {
         }
 
         const placeholders = monitorIds.map(() => "?").join(",");
-        const sql = `
+
+        // Do NOT read raw heartbeat here: clear-old-data prunes it daily to
+        // important beats + last 100 rows/monitor, so stable days have no rows.
+        // stat_daily keeps full per-day aggregates for the retention period.
+        const statSql = `
+            SELECT
+                monitor_id,
+                timestamp,
+                up,
+                down
+            FROM stat_daily
+            WHERE monitor_id IN (${placeholders})
+            ORDER BY monitor_id, timestamp
+        `;
+
+        const statRows = await R.getAll(statSql, [ ...monitorIds ]);
+
+        const downSql = `
             SELECT
                 h.monitor_id,
-                (julianday('now') - julianday(DATE(h.time))) AS days_ago,
-                MIN(h.status) AS status,
-                MIN(h.time) AS bucket_start,
-                MAX(h.time) AS bucket_end,
+                DATE(h.time) AS day,
                 MIN(CASE WHEN h.status = 0 THEN h.time END) AS down_time,
                 (
                     SELECT h2.msg
@@ -750,28 +764,42 @@ router.get("/api/overview/heartbeats", async (request, response) => {
                     LIMIT 1
                 ) AS down_msg
             FROM heartbeat h
-            WHERE h.monitor_id IN (${placeholders})
+            WHERE h.monitor_id IN (${placeholders}) AND h.status = 0
             GROUP BY h.monitor_id, DATE(h.time)
-            HAVING days_ago < ?
-            ORDER BY h.monitor_id, days_ago DESC
         `;
 
-        const rows = await R.getAll(sql, [ ...monitorIds, days ]);
+        const downRows = await R.getAll(downSql, [ ...monitorIds ]);
+
+        const downInfoMap = {};
+        for (const row of downRows) {
+            downInfoMap[`${row.monitor_id}|${row.day}`] = row;
+        }
+
+        const todayUtcStart = Math.floor(Date.now() / 1000 / 86400) * 86400;
 
         // bucketIdx: 0 = oldest calendar day in range, days-1 = today.
         const heartbeatData = {};
-        for (const row of rows) {
+        for (const row of statRows) {
+            const daysAgo = (todayUtcStart - row.timestamp) / 86400;
+            if (!Number.isInteger(daysAgo) || daysAgo < 0 || daysAgo >= days) {
+                continue;
+            }
+
             if (!heartbeatData[row.monitor_id]) {
                 heartbeatData[row.monitor_id] = [];
             }
-            const bucketIdx = (days - 1) - Math.floor(row.days_ago);
+
+            const bucketIdx = (days - 1) - daysAgo;
+            const dayDate = dayjs.unix(row.timestamp).utc().format("YYYY-MM-DD");
+            const downInfo = downInfoMap[`${row.monitor_id}|${dayDate}`];
+
             heartbeatData[row.monitor_id].push({
                 bucketIdx,
-                status: row.status,
-                start: row.bucket_start,
-                end: row.bucket_end,
-                downTime: row.down_time,
-                downMsg: row.down_msg,
+                status: row.down > 0 ? 0 : 1,
+                start: `${dayDate} 00:00:00.000`,
+                end: `${dayDate} 23:59:59.999`,
+                downTime: downInfo?.down_time || null,
+                downMsg: downInfo?.down_msg || null,
             });
         }
 
